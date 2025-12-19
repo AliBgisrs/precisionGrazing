@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MT GeoAI Ranch - IoT Monitor</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; margin: 0; background: #1a1a1a; color: white; overflow: hidden; }
+        .sidebar { position: fixed; left: 0; top: 0; width: 400px; height: 100%; background: #222; padding: 25px; z-index: 1000; border-right: 2px solid #444; overflow-y: auto; box-sizing: border-box; }
+        #map { height: 100vh; width: calc(100% - 400px); margin-left: 400px; background: #000; }
+        
+        .clock { font-family: monospace; font-size: 1.4em; color: #00ffcc; text-align: center; margin-bottom: 20px; border: 1px solid #333; padding: 10px; border-radius: 5px; background: #111; }
+        .card { background: #333; padding: 12px; border-radius: 8px; margin-bottom: 12px; border-left: 5px solid #27ae60; font-size: 0.9em; }
+        .census-item { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #444; }
+        
+        /* Layer & Label Styling */
+        .leaflet-interactive.bg-layer { pointer-events: none !important; }
+        .pasture-label { background: transparent !important; border: none !important; color: #ffeb3b; font-weight: bold; font-size: 12px; text-shadow: 2px 2px 4px #000; pointer-events: none !important; }
+        
+        .cow-icon { font-size: 18px; text-align: center; line-height: 1; }
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div id="live-clock" class="clock">00:00:00</div>
+    <h2>🌾 IoT CATTLE HUB</h2>
+    <p style="opacity: 0.6; margin-top: -10px; margin-bottom: 25px;">{{ info.name }} | GeoAI Research</p>
+
+    <div class="card" style="border-left-color: #f1c40f;">
+        <strong>Live County Census:</strong>
+        <div id="census-list" style="margin-top: 10px; max-height: 250px; overflow-y: auto;">
+            Awaiting IoT Pings...
+        </div>
+    </div>
+
+    <div id="data-panel" style="display:none;">
+        <div class="card" style="border-left-color: #3498db;">
+            <strong>Analysis Results:</strong>
+            <div style="margin-top:8px;">Forage (NDVI): <span id="ndvi" style="color:#00ffcc;">--</span></div>
+            <div style="margin-top:8px;">Soil Moisture: <span id="soil" style="color:#00ffcc;">--</span>%</div>
+            <div style="margin-top:8px;">Dist. Water: <span id="dist" style="color:#00ffcc;">--</span> km</div>
+        </div>
+        <div id="rec-box" style="background:#d35400; padding:15px; border-radius:8px; font-weight:bold;">
+            AI REC: <span id="recommendation">Analyzing...</span>
+        </div>
+    </div>
+
+    <p id="hint" style="text-align:center; color: #888; margin-top: 40px; border: 1px dashed #444; padding: 15px; border-radius: 8px;">
+        Click anywhere on the map to run a localized forage & moisture analysis.
+    </p>
+</div>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://leaflet.github.io/Leaflet.heat/dist/leaflet-heat.js"></script>
+
+<script>
+    // 1. Initialize Map
+    const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}');
+    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png');
+    
+    const map = L.map('map', { center: [46.87, -110.36], zoom: 8, layers: [satellite] });
+
+    // 2. Layer Groups
+    const pastureLayer = L.layerGroup().addTo(map);
+    const lakeLayer = L.layerGroup().addTo(map);
+    const cattleLayer = L.layerGroup().addTo(map);
+    const heatmapLayer = L.layerGroup().addTo(map);
+    const analysisLayer = L.layerGroup().addTo(map);
+
+    // 3. Initialize Heatmap Instance
+    let heatInstance = L.heatLayer([], {radius: 30, blur: 15, maxZoom: 10, gradient: {0.4: 'blue', 0.65: 'lime', 1: 'red'}}).addTo(heatmapLayer);
+
+    // 4. Load Static Vector Layers (Pastures & Lakes)
+    fetch('/static/ranch_features.geojson').then(res => res.json()).then(data => {
+        L.geoJSON(data, {
+            interactive: false,
+            style: { color: "#ffeb3b", weight: 2, fillOpacity: 0.1, className: 'bg-layer' },
+            onEachFeature: (f, l) => {
+                if (f.properties && f.properties.NAME) {
+                    l.bindTooltip(f.properties.NAME, { permanent: true, direction: 'center', className: 'pasture-label' });
+                }
+            }
+        }).addTo(pastureLayer);
+    });
+
+    fetch('/static/Lakes.geojson').then(res => res.json()).then(data => {
+        L.geoJSON(data, {
+            interactive: false,
+            style: { color: "#3498db", weight: 1, fillOpacity: 0.4, className: 'bg-layer' }
+        }).addTo(lakeLayer);
+    });
+
+    // 5. IoT Real-Time Update Logic
+    let cowMarkers = {};
+    const cowIcon = L.divIcon({ html: '🐄', className: 'cow-icon', iconSize: [20, 20] });
+
+    function refreshIoT() {
+        fetch('/get_cattle')
+            .then(res => res.json())
+            .then(data => {
+                // Update Heatmap
+                heatInstance.setLatLngs(data.heatmap);
+
+                // Update Cow Markers (Update existing instead of recreating)
+                data.cattle.forEach(cow => {
+                    if (cowMarkers[cow.id]) {
+                        cowMarkers[cow.id].setLatLng([cow.lat, cow.lon]);
+                    } else {
+                        cowMarkers[cow.id] = L.marker([cow.lat, cow.lon], {icon: cowIcon}).addTo(cattleLayer);
+                    }
+                });
+
+                // Update Census UI
+                const list = document.getElementById('census-list');
+                const counts = Object.entries(data.counts);
+                if (counts.length > 0) {
+                    list.innerHTML = counts
+                        .map(([name, count]) => `<div class="census-item"><span>${name}</span><strong>${count} head</strong></div>`)
+                        .join('');
+                } else {
+                    list.innerHTML = "No cattle detected in defined counties.";
+                }
+            });
+    }
+
+    // 6. Map Click Analysis
+    map.on('click', function(e) {
+        analysisLayer.clearLayers();
+        L.marker(e.latlng).addTo(analysisLayer);
+        
+        fetch('/analyze_ranch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({lat: e.latlng.lat, lon: e.latlng.lng})
+        })
+        .then(res => res.json()).then(data => {
+            document.getElementById('data-panel').style.display = 'block';
+            document.getElementById('hint').style.display = 'none';
+            document.getElementById('ndvi').innerText = data.ndvi;
+            document.getElementById('soil').innerText = data.soil_moisture;
+            document.getElementById('dist').innerText = data.dist_water;
+            document.getElementById('recommendation').innerText = data.recommendation;
+
+            const waterPos = [data.water_loc.lat, data.water_loc.lon];
+            L.circleMarker(waterPos, {color: '#3498db', radius: 8}).addTo(analysisLayer);
+            L.polyline([e.latlng, waterPos], {color: '#3498db', weight: 2, dashArray: '5,10'}).addTo(analysisLayer);
+        });
+    });
+
+    // 7. Layer Controls
+    L.control.layers({ "Satellite": satellite, "Street Map": osm }, { 
+        "Cattle Heatmap": heatmapLayer,
+        "Cattle Markers": cattleLayer,
+        "Pasture Outlines": pastureLayer,
+        "Lakes/Water": lakeLayer
+    }).addTo(map);
+
+    // Initializations
+    setInterval(refreshIoT, 2000);
+    setInterval(() => { document.getElementById('live-clock').innerText = new Date().toLocaleString(); }, 1000);
+</script>
+</body>
+</html>
